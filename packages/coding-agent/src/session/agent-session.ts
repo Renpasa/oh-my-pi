@@ -10634,8 +10634,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * transport only after this promise resolves, so an ACK durably means the
 	 * target session actually accepted the wake. Duplicate delivery of the
 	 * same `eventId` is a transport-level no-op (see `SocketDaemonClient`);
-	 * this method itself has no eventId-specific dedupe because it is never
-	 * called twice for one event by a correctly behaving transport.
+	 * this method additionally refuses an `eventId` it has already injected, so
+	 * a redelivery that bypasses the transport cannot reach the model twice.
+	 * Unresolved wakes are never evicted; at the bound it rejects the new wake
+	 * without ACKing it, leaving the broker free to retry.
 	 */
 	queueParentWake(event: ParentWakeEntry): Promise<void> {
 		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before parent wake delivery"));
