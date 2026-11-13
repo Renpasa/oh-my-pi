@@ -171,6 +171,15 @@ interface WakeRegistration {
 	persistError?: Error;
 }
 
+/** The mutable, persisted part of a {@link WakeEventRecord}. */
+interface WakeEventState {
+	status: ParentWakeDispatchStatus;
+	dispatchedAt?: number;
+	ackedAt?: number;
+	failureCode?: ParentWakeFailureCode;
+	failureMessage?: string;
+}
+
 /** Durable record of one Parent Wake event's dispatch/ACK lifecycle. */
 interface WakeEventRecord {
 	event: ParentWakeEvent;
@@ -186,8 +195,13 @@ interface WakeEventRecord {
 	deliveredTo?: IpcConnection;
 	/** Loaded from disk by a restarted broker and not yet re-dispatched or settled. */
 	recovered?: boolean;
-	/** When this record was last written; gates in-memory eviction of terminal records. */
+	/**
+	 * When this record last settled on disk; gates in-memory eviction of terminal records. Records read
+	 * back from disk are `0` (long settled); an unset value is never evicted.
+	 */
 	lastPersistAt?: number;
+	/** An acknowledgement being written; readers and other transitions wait for it instead of seeing half of it. */
+	ackInFlight?: Promise<void>;
 }
 
 interface DaemonLogRead {
@@ -1694,7 +1708,20 @@ class DaemonBroker {
 		existing.updatedAt = Date.now();
 		this.#persistWakeRegistration(existing);
 		await existing.persistQueue;
+		this.#shedStaleRegistrations();
 		return { op: "wake-unregister", target };
+	}
+
+	/** Keep at most {@link MAX_RESIDENT_TERMINAL_WAKE_RECORDS} stale tombstones in memory; the rest stay durable on disk. */
+	#shedStaleRegistrations(): void {
+		let stale = 0;
+		for (const registration of this.#wakeRegistrations.values()) if (registration.stale) stale++;
+		for (const [sessionId, registration] of this.#wakeRegistrations) {
+			if (stale <= MAX_RESIDENT_TERMINAL_WAKE_RECORDS) return;
+			if (!registration.stale) continue;
+			this.#wakeRegistrations.delete(sessionId);
+			stale--;
+		}
 	}
 
 	/**
@@ -1857,6 +1884,8 @@ class DaemonBroker {
 		while ((record.status === "dispatched" || record.status === "pending") && Date.now() < deadline) {
 			await Bun.sleep(WAKE_POLL_INTERVAL_MS);
 		}
+		// An acknowledgement mid-write decides first; only a still-unacknowledged dispatch times out.
+		while (record.ackInFlight) await record.ackInFlight;
 		if (record.status === "dispatched") {
 			record.status = "failed";
 			record.failureCode = "timeout";
@@ -1890,27 +1919,34 @@ class DaemonBroker {
 		if (record.deliveredTo !== socket) {
 			throw new Error(`Parent wake event ${eventId} was not delivered to this connection`);
 		}
+		// One acknowledgement transition at a time: a concurrent ack waits for the one in flight, then re-reads.
+		while (record.ackInFlight) await record.ackInFlight;
 		if (record.status === "acked") return { op: "wake-ack", result: this.#wakeResult(record) };
 		const lateAfterTimeout = record.status === "failed" && record.failureCode === "timeout";
 		if (record.status !== "dispatched" && !lateAfterTimeout) {
 			throw new Error(`Parent wake event ${eventId} is not awaiting acknowledgement (status: ${record.status})`);
 		}
-		const previous = {
-			status: record.status,
-			ackedAt: record.ackedAt,
-			failureCode: record.failureCode,
-			failureMessage: record.failureMessage,
+		// Publish nothing until the acknowledgement is durable: the next state is written first and only then
+		// applied, so a concurrent replay can never observe an `acked` that a failed write later retracts.
+		const next: WakeEventState = {
+			status: "acked",
+			dispatchedAt: record.dispatchedAt,
+			ackedAt: Date.now(),
+			failureCode: undefined,
+			failureMessage: undefined,
 		};
-		record.status = "acked";
-		record.ackedAt = Date.now();
-		record.failureCode = undefined;
-		record.failureMessage = undefined;
-		this.#persistWakeEvent(record);
-		await record.persistQueue;
-		if (record.persistError) {
-			// An ack that cannot be durably recorded must not be reported: restore the pre-ack state.
-			Object.assign(record, previous);
-			throw new Error(`Parent wake event ${eventId} acknowledgement could not be durably recorded; not acknowledged`);
+		const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
+		record.ackInFlight = settled;
+		try {
+			if (!(await this.#persistWakeEvent(record, next))) {
+				throw new Error(
+					`Parent wake event ${eventId} acknowledgement could not be durably recorded; not acknowledged`,
+				);
+			}
+			Object.assign(record, next);
+		} finally {
+			record.ackInFlight = undefined;
+			settle();
 		}
 		return { op: "wake-ack", result: this.#wakeResult(record) };
 	}
@@ -1927,23 +1963,29 @@ class DaemonBroker {
 		};
 	}
 
-	#persistWakeEvent(record: WakeEventRecord): void {
+	/**
+	 * Queue a write of `state` (default: the record's current state, captured now) and resolve whether
+	 * that write reached disk. Callers that must not publish uncommitted state pass the next state here
+	 * and apply it to the record only after a `true`.
+	 */
+	#persistWakeEvent(record: WakeEventRecord, state: WakeEventState = record): Promise<boolean> {
 		const dir = path.join(this.#runtimeDir, PARENT_WAKE_DIR, PARENT_WAKE_EVENTS_DIR);
 		const metaPath = path.join(dir, `${record.event.eventId}.json`);
 		const metadata = {
 			event: record.event,
-			status: record.status,
-			dispatchedAt: record.dispatchedAt,
-			ackedAt: record.ackedAt,
-			failureCode: record.failureCode,
-			failureMessage: record.failureMessage,
+			status: state.status,
+			dispatchedAt: state.dispatchedAt,
+			ackedAt: state.ackedAt,
+			failureCode: state.failureCode,
+			failureMessage: state.failureMessage,
 		};
-		record.persistQueue = record.persistQueue
+		const written = record.persistQueue
 			.then(async () => {
 				await fs.mkdir(dir, { recursive: true, mode: 0o700 });
 				await writeFileAtomic(metaPath, JSON.stringify(metadata));
 				record.persistError = undefined;
 				record.lastPersistAt = Date.now();
+				return true;
 			})
 			.catch(error => {
 				record.persistError = toError(error);
@@ -1951,7 +1993,10 @@ class DaemonBroker {
 					eventId: record.event.eventId,
 					error: error instanceof Error ? error.message : String(error),
 				});
+				return false;
 			});
+		record.persistQueue = written.then(() => undefined);
+		return written;
 	}
 
 	#persistWakeRegistration(registration: WakeRegistration): void {
@@ -1984,15 +2029,22 @@ class DaemonBroker {
 		await this.#recoverWakeEvents();
 	}
 
-	/** Insert a record, shedding long-settled terminal ones beyond the resident bound (they remain on disk). */
+	/**
+	 * Insert a record, shedding the oldest evictable terminal ones beyond the resident bound (they remain
+	 * durable on disk). Unfinished events never leave memory, and neither does a timed-out event whose
+	 * delivery connection is still open: it may yet receive its genuine late acknowledgement.
+	 */
 	#rememberWakeEvent(record: WakeEventRecord): void {
 		this.#wakeEvents.set(record.event.eventId, record);
 		if (this.#wakeEvents.size <= MAX_RESIDENT_TERMINAL_WAKE_RECORDS) return;
 		const now = Date.now();
 		for (const [eventId, candidate] of this.#wakeEvents) {
 			if (this.#wakeEvents.size <= MAX_RESIDENT_TERMINAL_WAKE_RECORDS) return;
+			if (candidate === record || candidate.lastPersistAt === undefined) continue;
 			const terminal = candidate.status === "acked" || candidate.status === "failed";
-			if (terminal && now - (candidate.lastPersistAt ?? now) > WAKE_EVICTION_SETTLE_MS) {
+			const awaitingLateAck =
+				candidate.status === "failed" && candidate.deliveredTo !== undefined && !candidate.deliveredTo.closed;
+			if (terminal && !awaitingLateAck && !candidate.ackInFlight && now - candidate.lastPersistAt > WAKE_EVICTION_SETTLE_MS) {
 				this.#wakeEvents.delete(eventId);
 			}
 		}
@@ -2065,6 +2117,8 @@ class DaemonBroker {
 			persistQueue: Promise.resolve(),
 		};
 		record.recovered = record.status === "pending" || record.status === "dispatched";
+		// Read back from disk: already durable and long settled, so immediately evictable once terminal.
+		record.lastPersistAt = 0;
 		return record;
 	}
 

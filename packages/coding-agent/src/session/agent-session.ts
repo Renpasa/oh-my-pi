@@ -525,6 +525,10 @@ export * from "./agent-session-events";
 export * from "./agent-session-types";
 export type { AdvisorStats, AdvisorStatusOverviewEntry, PerAdvisorStat } from "./session-advisors";
 
+/** Queued-but-uninjected parent wakes a session holds before it refuses new ones. */
+const MAX_UNRESOLVED_PARENT_WAKES = 512;
+/** Injected parent-wake ids remembered in memory; older ones are recognised from the persisted session entries. */
+const MAX_REMEMBERED_PARENT_WAKES = 512;
 const SESSION_STOP_CONTINUATION_CAP = 8;
 /** Assistant thinking+reply words a deferred auto-title waits for before retitling from context. */
 const DEFERRED_TITLE_MIN_WORDS = 40;
@@ -1126,8 +1130,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
-	/** Parent wake receipts by event id: in-flight or accepted this process; failures are dropped so a redelivery can retry. */
-	readonly #parentWakeReceipts = new Map<string, Promise<void>>();
+	/** Parent wakes queued but not yet injected, by event id. Never evicted: a redelivery must find its receipt. */
+	readonly #parentWakeInFlight = new Map<string, Promise<void>>();
+	/** Recently injected event ids (bounded); the persisted session entries are the durable record behind it. */
+	readonly #parentWakeInjected = new Set<string>();
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -10645,22 +10651,33 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A wake already accepted by this session — in flight or committed to the session history, which
 		// survives restarts — is acknowledged again without being injected a second time. This is what makes
 		// a lost ACK followed by a broker redelivery harmless.
-		const known = this.#parentWakeReceipts.get(validated.eventId);
-		if (known) return known;
-		if (this.sessionManager.getEntries().some(entry => entryCarriesParentWake(entry, validated.eventId))) {
+		const inFlight = this.#parentWakeInFlight.get(validated.eventId);
+		if (inFlight) return inFlight;
+		if (
+			this.#parentWakeInjected.has(validated.eventId) ||
+			this.sessionManager.getEntries().some(entry => entryCarriesParentWake(entry, validated.eventId))
+		) {
 			return Promise.resolve();
 		}
-		const delivered = this.yieldQueue.enqueueWithReceipt<ParentWakeEntry>(PARENT_WAKE_MESSAGE_TYPE, validated);
-		this.#parentWakeReceipts.set(validated.eventId, delivered);
-		if (this.#parentWakeReceipts.size > 512) {
-			const oldest = this.#parentWakeReceipts.keys().next().value;
-			if (oldest !== undefined) this.#parentWakeReceipts.delete(oldest);
+		// Backpressure instead of eviction: with the unresolved set full, refuse (no ACK) and let the broker retry.
+		if (this.#parentWakeInFlight.size >= MAX_UNRESOLVED_PARENT_WAKES) {
+			return Promise.reject(new Error("Too many unresolved parent wakes queued for this session"));
 		}
-		delivered.catch(() => {
-			if (this.#parentWakeReceipts.get(validated.eventId) === delivered) {
-				this.#parentWakeReceipts.delete(validated.eventId);
-			}
-		});
+		const delivered = this.yieldQueue.enqueueWithReceipt<ParentWakeEntry>(PARENT_WAKE_MESSAGE_TYPE, validated);
+		this.#parentWakeInFlight.set(validated.eventId, delivered);
+		delivered.then(
+			() => {
+				this.#parentWakeInFlight.delete(validated.eventId);
+				this.#parentWakeInjected.add(validated.eventId);
+				if (this.#parentWakeInjected.size > MAX_REMEMBERED_PARENT_WAKES) {
+					const oldest = this.#parentWakeInjected.values().next().value;
+					if (oldest !== undefined) this.#parentWakeInjected.delete(oldest);
+				}
+			},
+			() => {
+				this.#parentWakeInFlight.delete(validated.eventId);
+			},
+		);
 		this.yieldQueue.requestIdleFlush();
 		return delivered;
 	}
