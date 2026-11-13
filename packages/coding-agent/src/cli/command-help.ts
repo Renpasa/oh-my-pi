@@ -113,6 +113,10 @@ export const predictHelp = {
 	description: "Type a prompt and compare every word-completion engine's ghost text live",
 } satisfies CommandMetadata;
 
+export const parentWakeHelp = {
+	description: "Submit one Parent Wake Transport v1 event (stdin JSON in, stdout JSON result out)",
+} satisfies CommandMetadata;
+
 export const psHelp = {
 	description: "List and control daemon-supervised background processes (logs, stop, kill, restart)",
 } satisfies CommandMetadata;

@@ -1,0 +1,1 @@
+Parent wake: {{kind}} ({{pointerCount}} pointer(s)). Fetch canonical state from the referenced pointer(s) yourself before responding — this message carries no inline content. [wake {{eventId}}; pointers: {{#each pointers}}{{kind}}={{ref}}{{#unless @last}}, {{/unless}}{{/each}}]

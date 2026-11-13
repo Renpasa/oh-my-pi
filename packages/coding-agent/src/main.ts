@@ -109,6 +109,7 @@ import {
 	SessionModelRestoreError,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
+import { startParentWakeListenerFromEnvironment, stopParentWakeListenerOnSessionChange } from "./launch/parent-wake-listener";
 import { createAuthStorageSettingsSync, describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
@@ -2690,6 +2691,29 @@ export async function runRootCommand(
 				throw error;
 			}
 			scheduleMarketplaceAutoUpdate(marketplaceAutoUpdateOptions);
+
+			// Opt-in Parent Wake Transport v1 target registration. No-op unless
+			// OMP_PARENT_WAKE_TARGET_SESSION_ID / OMP_PARENT_WAKE_RUNTIME_SCOPE are
+			// both set (see launch/parent-wake-listener.ts) — ordinary/global OMP
+			// launches never touch this. Torn down on session-identity replacement
+			// (fork/resume/move) so a stale registration cannot survive it.
+			const parentWakeHandle = await startParentWakeListenerFromEnvironment(
+				session.sessionManager.getCwd(),
+				session,
+			).catch(error => {
+				logger.warn("Parent wake listener failed to start", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return undefined;
+			});
+			if (parentWakeHandle) {
+				stopParentWakeListenerOnSessionChange(parentWakeHandle, callback =>
+					session.registerSessionChangeCallback(callback),
+				);
+				// A disposed session can no longer accept wakes: tombstone the registration now
+				// instead of leaving a live target that rejects every wake until the process exits.
+				session.addDisposer(() => parentWakeHandle.stop());
+			}
 
 			// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 			// scan, collab mirror, resumed process) has a sessionFile but no in-memory

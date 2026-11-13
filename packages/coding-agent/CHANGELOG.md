@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in Parent Wake Transport v1: `omp parent-wake` delivers one bounded, pointer-only wake event to a registered session, acknowledged only after that session accepts it. Nothing registers unless `OMP_PARENT_WAKE_TARGET_SESSION_ID` and `OMP_PARENT_WAKE_RUNTIME_SCOPE` are set; `OMP_PARENT_WAKE_BROKER_RUNTIME_DIR` / `--runtime-dir` select an isolated broker.
+
 ## [18.19.0] - 2026-11-12
 
 ### Breaking Changes

@@ -24,8 +24,118 @@ export const DAEMON_RUNTIME_DIR_ENV = "OMP_DAEMON_RUNTIME_DIR";
 /** Optional environment key overriding last-client shutdown grace. */
 export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 
+/**
+ * Parent Wake Transport v1 — opt-in environment keys.
+ *
+ * Unset (the default): the launching AgentSession never registers as a
+ * Parent Wake target and ordinary/global OMP behavior is unchanged. Both
+ * keys must be set together to opt in; see {@link ParentWakeTarget}.
+ */
+/** Stable identity of the target Parent AgentSession to register under. */
+export const PARENT_WAKE_TARGET_SESSION_ID_ENV = "OMP_PARENT_WAKE_TARGET_SESSION_ID";
+/** Candidate/runtime provenance accompanying {@link PARENT_WAKE_TARGET_SESSION_ID_ENV}. */
+export const PARENT_WAKE_TARGET_RUNTIME_SCOPE_ENV = "OMP_PARENT_WAKE_RUNTIME_SCOPE";
+/**
+ * Optional absolute private runtime directory of an isolated broker. When set, the target registers
+ * with the broker owned by that directory instead of the shared project broker (the counterpart of
+ * `omp parent-wake --runtime-dir`).
+ */
+export const PARENT_WAKE_BROKER_RUNTIME_DIR_ENV = "OMP_PARENT_WAKE_BROKER_RUNTIME_DIR";
+
 /** Signals accepted by daemon input operations. */
 export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKILL";
+
+/**
+ * Parent Wake Transport v1 — cross-process wake delivery to one explicitly
+ * registered Parent AgentSession, routed through the existing daemon broker
+ * socket for one project/runtime scope.
+ *
+ * Field names below are the wire contract the `omp parent-wake` CLI and any
+ * external adapter (e.g. an orchestrator) read/write as JSON — keep them
+ * stable.
+ */
+
+/**
+ * Explicit identity of a Parent Wake target.
+ *
+ * - `projectDir`: canonical project directory (or synthetic global scope
+ *   directory) that must match the broker's own scope — a target cannot
+ *   register with, and an event cannot dispatch across, a different scope.
+ * - `sessionId`: stable identity of the target Parent AgentSession. This is
+ *   the routing key; distinct from any caller/submitter identity.
+ * - `runtimeScope`: candidate/runtime provenance (e.g. a worktree or branch
+ *   label) bound to `sessionId` at registration time, so a caller supplying
+ *   the right `sessionId` under the wrong `runtimeScope` cannot be mistaken
+ *   for the real target (`wrong-target` failure).
+ */
+export interface ParentWakeTarget {
+	projectDir: string;
+	sessionId: string;
+	runtimeScope: string;
+}
+
+/** One bounded, canonical pointer the target dereferences itself — never inline content. */
+export interface ParentWakePointer {
+	kind: string;
+	ref: string;
+}
+
+/** Max length for `sessionId`, `runtimeScope`, and `eventId` (filesystem-safe charset). */
+export const PARENT_WAKE_ID_MAX_LENGTH = 128;
+/** Max pointers carried by one {@link ParentWakeEvent}. */
+export const PARENT_WAKE_MAX_POINTERS = 8;
+/** Max length of one pointer's `kind` field. */
+export const PARENT_WAKE_POINTER_KIND_MAX_LENGTH = 64;
+/** Max length of one pointer's `ref` field. */
+export const PARENT_WAKE_POINTER_REF_MAX_LENGTH = 512;
+/** Max length of the event `kind` field. */
+export const PARENT_WAKE_KIND_MAX_LENGTH = 64;
+/** Filesystem-safe identity charset shared by `sessionId`, `runtimeScope`, and `eventId`. */
+export const PARENT_WAKE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * One durable wake event. `eventId` is caller-assigned and is the dedupe key:
+ * resubmitting the same `eventId` (retry, replay, or after a broker restart)
+ * never dispatches a second wake — it returns the persisted {@link ParentWakeResult}.
+ */
+export interface ParentWakeEvent {
+	eventId: string;
+	kind: string;
+	pointers: ParentWakePointer[];
+	createdAt: number;
+	target: ParentWakeTarget;
+	/** Optional submitter identity for audit/logging — never used for routing or fail-closed decisions. */
+	producerSessionId?: string;
+}
+
+/** Terminal reasons a Parent Wake event failed to reach an ACK. */
+export type ParentWakeFailureCode =
+	| "target-missing"
+	| "target-dead"
+	| "target-stale"
+	| "wrong-target"
+	| "timeout"
+	| "invalid-payload";
+
+/** Durable dispatch/ACK lifecycle of one {@link ParentWakeEvent}. */
+export type ParentWakeDispatchStatus = "pending" | "dispatched" | "acked" | "failed";
+
+/** Structured, durable outcome of one Parent Wake submission. */
+export interface ParentWakeResult {
+	eventId: string;
+	target: ParentWakeTarget;
+	status: ParentWakeDispatchStatus;
+	dispatchedAt?: number;
+	ackedAt?: number;
+	failureCode?: ParentWakeFailureCode;
+	failureMessage?: string;
+}
+
+/** Unsolicited push delivering one wake event to its registered target socket. */
+export interface ParentWakeDelivery {
+	event: "parent-wake";
+	wakeEvent: ParentWakeEvent;
+}
 
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
@@ -65,7 +175,11 @@ export type DaemonOperation =
 	| { op: "describe"; name: string }
 	/** Abort this connection's in-flight `wait`/follow-`logs` request `requestId`. Legacy brokers reject it. */
 	| { op: "cancel"; requestId: string }
-	| { op: "shutdown" };
+	| { op: "shutdown" }
+	| { op: "wake-register"; target: ParentWakeTarget }
+	| { op: "wake-unregister"; target: ParentWakeTarget }
+	| { op: "wake-submit"; event: ParentWakeEvent; timeoutMs: number }
+	| { op: "wake-ack"; eventId: string; target: ParentWakeTarget };
 
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
@@ -91,7 +205,11 @@ export type DaemonRpcResult =
 	| { op: "mode"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
 	| { op: "cancel"; cancelled: boolean }
-	| { op: "shutdown" };
+	| { op: "shutdown" }
+	| { op: "wake-register"; target: ParentWakeTarget }
+	| { op: "wake-unregister"; target: ParentWakeTarget }
+	| { op: "wake-submit"; result: ParentWakeResult }
+	| { op: "wake-ack"; result: ParentWakeResult };
 
 /** Authenticated request envelope used by socket clients. */
 export interface DaemonWireRequest {
@@ -118,7 +236,7 @@ export interface DaemonCompletionNotification {
 	daemon: DaemonSnapshot;
 }
 
-export type DaemonWireMessage = DaemonWireResponse | DaemonCompletionNotification;
+export type DaemonWireMessage = DaemonWireResponse | DaemonCompletionNotification | ParentWakeDelivery;
 
 function record(value: unknown, label: string): Record<string, unknown> {
 	if (!isRecord(value)) throw new Error(`${label} must be an object`);
@@ -306,6 +424,7 @@ export function parseDaemonWireMessage(value: unknown): DaemonWireMessage {
 			daemon: parseDaemonSnapshot(source.daemon),
 		};
 	}
+	if (source.event === "parent-wake") return parseParentWakeDelivery(value);
 	return parseDaemonWireResponse(value);
 }
 
@@ -377,6 +496,21 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				throw new Error("operation.mode must be persist, session, or detached");
 			return { op, name: stringValue(source.name, "operation.name"), mode };
 		}
+		case "wake-register":
+		case "wake-unregister":
+			return { op, target: parseParentWakeTarget(source.target) };
+		case "wake-submit":
+			return {
+				op,
+				event: parseParentWakeEvent(source.event),
+				timeoutMs: numberValue(source.timeoutMs, "operation.timeoutMs"),
+			};
+		case "wake-ack":
+			return {
+				op,
+				eventId: parentWakeId(source.eventId, "operation.eventId"),
+				target: parseParentWakeTarget(source.target),
+			};
 		default:
 			throw new Error(`Unknown daemon operation: ${op}`);
 	}
@@ -436,5 +570,97 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			return { op: "cancel", cancelled: booleanValue(source.cancelled, "result.cancelled") };
 		case "shutdown":
 			return { op: "shutdown" };
+		case "wake-register":
+		case "wake-unregister":
+			return { op: operation.op, target: parseParentWakeTarget(source.target) };
+		case "wake-submit":
+			return { op: "wake-submit", result: parseParentWakeResult(source.result) };
+		case "wake-ack":
+			return { op: "wake-ack", result: parseParentWakeResult(source.result) };
 	}
+}
+
+function parentWakeId(value: unknown, label: string): string {
+	const id = stringValue(value, label);
+	if (!PARENT_WAKE_ID_PATTERN.test(id)) {
+		throw new Error(`${label} must be 1-${PARENT_WAKE_ID_MAX_LENGTH} letters, numbers, dots, underscores, or hyphens`);
+	}
+	return id;
+}
+
+/** Decode and validate a Parent Wake target identity. */
+export function parseParentWakeTarget(value: unknown): ParentWakeTarget {
+	const source = record(value, "wake target");
+	return {
+		projectDir: stringValue(source.projectDir, "target.projectDir"),
+		sessionId: parentWakeId(source.sessionId, "target.sessionId"),
+		runtimeScope: parentWakeId(source.runtimeScope, "target.runtimeScope"),
+	};
+}
+
+function parseParentWakePointer(value: unknown, label: string): ParentWakePointer {
+	const source = record(value, label);
+	const kind = stringValue(source.kind, `${label}.kind`);
+	const ref = stringValue(source.ref, `${label}.ref`);
+	if (kind.length > PARENT_WAKE_POINTER_KIND_MAX_LENGTH) throw new Error(`${label}.kind is too long`);
+	if (ref.length > PARENT_WAKE_POINTER_REF_MAX_LENGTH) throw new Error(`${label}.ref is too long`);
+	return { kind, ref };
+}
+
+function parseParentWakePointers(value: unknown): ParentWakePointer[] {
+	if (!Array.isArray(value)) throw new Error("event.pointers must be an array");
+	if (value.length > PARENT_WAKE_MAX_POINTERS) {
+		throw new Error(`event.pointers must have at most ${PARENT_WAKE_MAX_POINTERS} entries`);
+	}
+	return value.map((item, index) => parseParentWakePointer(item, `event.pointers[${index}]`));
+}
+
+/** Decode and validate one Parent Wake event, including its bounded pointer payload. */
+export function parseParentWakeEvent(value: unknown): ParentWakeEvent {
+	const source = record(value, "wake event");
+	const kind = stringValue(source.kind, "event.kind");
+	if (kind.length > PARENT_WAKE_KIND_MAX_LENGTH) throw new Error("event.kind is too long");
+	return {
+		eventId: parentWakeId(source.eventId, "event.eventId"),
+		kind,
+		pointers: parseParentWakePointers(source.pointers),
+		createdAt: numberValue(source.createdAt, "event.createdAt"),
+		target: parseParentWakeTarget(source.target),
+		producerSessionId:
+			source.producerSessionId === undefined ? undefined : parentWakeId(source.producerSessionId, "event.producerSessionId"),
+	};
+}
+
+function parentWakeFailureCode(value: unknown): ParentWakeFailureCode {
+	const code = stringValue(value, "result.failureCode");
+	if (code === "target-missing" || code === "target-dead" || code === "target-stale") return code;
+	if (code === "wrong-target" || code === "timeout" || code === "invalid-payload") return code;
+	throw new Error(`Unknown parent wake failure code: ${code}`);
+}
+
+function parentWakeDispatchStatus(value: unknown): ParentWakeDispatchStatus {
+	const status = stringValue(value, "result.status");
+	if (status === "pending" || status === "dispatched" || status === "acked" || status === "failed") return status;
+	throw new Error(`Unknown parent wake status: ${status}`);
+}
+
+/** Decode and validate one durable Parent Wake result. */
+export function parseParentWakeResult(value: unknown): ParentWakeResult {
+	const source = record(value, "wake result");
+	return {
+		eventId: parentWakeId(source.eventId, "result.eventId"),
+		target: parseParentWakeTarget(source.target),
+		status: parentWakeDispatchStatus(source.status),
+		dispatchedAt: optionalNumber(source.dispatchedAt, "result.dispatchedAt"),
+		ackedAt: optionalNumber(source.ackedAt, "result.ackedAt"),
+		failureCode: source.failureCode === undefined ? undefined : parentWakeFailureCode(source.failureCode),
+		failureMessage: optionalString(source.failureMessage, "result.failureMessage"),
+	};
+}
+
+/** Decode and validate one unsolicited Parent Wake delivery. */
+export function parseParentWakeDelivery(value: unknown): ParentWakeDelivery {
+	const source = record(value, "parent wake delivery");
+	if (source.event !== "parent-wake") throw new Error("delivery.event must be parent-wake");
+	return { event: "parent-wake", wakeEvent: parseParentWakeEvent(source.wakeEvent) };
 }

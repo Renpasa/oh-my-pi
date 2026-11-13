@@ -14,6 +14,9 @@ import {
 	type DaemonOperation,
 	type DaemonRpcResult,
 	type DaemonWireMessage,
+	type ParentWakeDelivery,
+	type ParentWakeEvent,
+	type ParentWakeTarget,
 	parseDaemonRpcResult,
 	parseDaemonWireMessage,
 } from "./protocol";
@@ -57,6 +60,13 @@ export interface DaemonBrokerClient {
 		owner: string,
 		sink: (notification: DaemonCompletionNotification) => Promise<void> | void,
 	): (options?: DaemonCompletionUnregisterOptions) => void;
+	/**
+	 * Register this connection as the live Parent Wake sink for `target`.
+	 * `sink` is invoked once per distinct `eventId`; the client ACKs
+	 * automatically once `sink` resolves. Returns an unregister function whose
+	 * promise settles once the broker has tombstoned (or failed to tombstone) the registration.
+	 */
+	onParentWake(target: ParentWakeTarget, sink: (event: ParentWakeEvent) => Promise<void> | void): () => Promise<void>;
 	/** Canonical project directory or synthetic directory identifying a global scope. */
 	readonly projectDir: string;
 	request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult>;
@@ -105,6 +115,7 @@ function requestTimeoutMs(operation: DaemonOperation): number {
 		case "wait":
 		case "logs":
 		case "stop":
+		case "wake-submit":
 			return operation.timeoutMs + 5_000;
 		default:
 			return 30_000;
@@ -125,6 +136,10 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly #completionReplays = new Set<string>();
 	readonly #inFlightCompletionIds = new Set<string>();
 	readonly #completionSubscriptionId = crypto.randomUUID();
+	readonly #wakeSinks = new Map<string, (event: ParentWakeEvent) => Promise<void> | void>();
+	readonly #wakeTargets = new Map<string, ParentWakeTarget>();
+	readonly #seenWakeEventKeys = new Set<string>();
+	readonly #inFlightWakeEventKeys = new Set<string>();
 	#socket: IpcConnection | undefined;
 	#connectPromise: Promise<void> | undefined;
 	#closed = false;
@@ -210,6 +225,8 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#completionSinks.clear();
 		this.#preservedCompletionOwners.clear();
 		this.#completionReplays.clear();
+		this.#wakeSinks.clear();
+		this.#wakeTargets.clear();
 		this.#socket = undefined;
 		this.#rejectPending(new Error("Daemon broker client closed"));
 	}
@@ -231,12 +248,48 @@ class SocketDaemonClient implements DaemonBrokerClient {
 				this.#preservedCompletionOwners.delete(owner);
 				this.#completionUnsubscribes.add(owner);
 			}
-			if (this.#completionSinks.size === 0 && this.#completionReconnectTimer) {
+			if (this.#completionSinks.size === 0 && this.#wakeTargets.size === 0 && this.#completionReconnectTimer) {
 				clearTimeout(this.#completionReconnectTimer);
 				this.#completionReconnectTimer = undefined;
 			}
 			this.#publishCompletionOwners();
 		};
+	}
+
+	onParentWake(target: ParentWakeTarget, sink: (event: ParentWakeEvent) => Promise<void> | void): () => Promise<void> {
+		this.#wakeSinks.set(target.sessionId, sink);
+		this.#wakeTargets.set(target.sessionId, target);
+		void this.request({ op: "wake-register", target }).catch(error => {
+			logger.warn("Parent wake registration failed", {
+				sessionId: target.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		return async () => {
+			if (this.#wakeSinks.get(target.sessionId) !== sink) return;
+			this.#wakeSinks.delete(target.sessionId);
+			this.#wakeTargets.delete(target.sessionId);
+			if (this.#closed) return;
+			try {
+				await this.request({ op: "wake-unregister", target });
+			} catch {
+				// Best-effort: an abrupt disconnect is still detected broker-side (target-dead).
+			}
+		};
+	}
+
+	/** Reassert every held Parent Wake registration after a (re)connect — registration itself does not piggyback on every request like completion owners do. */
+	async #republishWakeTargets(): Promise<void> {
+		for (const target of this.#wakeTargets.values()) {
+			try {
+				await this.request({ op: "wake-register", target });
+			} catch (error) {
+				logger.warn("Parent wake re-registration failed", {
+					sessionId: target.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	}
 
 	#publishCompletionOwners(): void {
@@ -247,7 +300,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	#scheduleCompletionReconnect(): void {
 		if (
 			this.#closed ||
-			this.#completionSinks.size === 0 ||
+			(this.#completionSinks.size === 0 && this.#wakeTargets.size === 0) ||
 			this.#completionReconnectTimer !== undefined ||
 			(this.#socket !== undefined && !this.#socket.closed)
 		) {
@@ -332,6 +385,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 				this.#scheduleCompletionReconnect();
 			},
 		);
+		if (this.#wakeTargets.size > 0) void this.#republishWakeTargets();
 	}
 
 	#onLine(line: string): void {
@@ -351,16 +405,17 @@ class SocketDaemonClient implements DaemonBrokerClient {
 				typeof decoded === "object" &&
 				decoded !== null &&
 				"event" in decoded &&
-				decoded.event === "daemon-completed"
+				(decoded.event === "daemon-completed" || decoded.event === "parent-wake")
 			) {
-				logger.warn("Ignoring malformed daemon completion", { error: parseError.message });
+				logger.warn("Ignoring malformed daemon event", { event: decoded.event, error: parseError.message });
 				return;
 			}
 			this.#rejectPending(parseError);
 			return;
 		}
 		if ("event" in message) {
-			void this.#deliverCompletion(message);
+			if (message.event === "daemon-completed") void this.#deliverCompletion(message);
+			else void this.#deliverParentWake(message);
 			return;
 		}
 		const response = message;
@@ -407,6 +462,63 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		} finally {
 			this.#inFlightCompletionIds.delete(message.completionId);
 		}
+	}
+
+	async #deliverParentWake(message: ParentWakeDelivery): Promise<void> {
+		const { eventId } = message.wakeEvent;
+		const target = message.wakeEvent.target;
+		// Strict identity: only the exact registered session + runtime scope + scope
+		// directory may receive this wake. A delivery addressed anywhere else is
+		// dropped unacknowledged, so it can never be mistaken for a sink acceptance.
+		const registered = this.#wakeTargets.get(target.sessionId);
+		const sink = this.#wakeSinks.get(target.sessionId);
+		if (
+			!registered ||
+			!sink ||
+			registered.runtimeScope !== target.runtimeScope ||
+			registered.projectDir !== target.projectDir
+		) {
+			logger.warn("Ignoring parent wake addressed to a target this client does not hold", {
+				sessionId: target.sessionId,
+				eventId,
+			});
+			return;
+		}
+		const key = `${target.sessionId}\n${eventId}`;
+		if (this.#seenWakeEventKeys.has(key)) {
+			this.#ackParentWake(eventId, target);
+			return;
+		}
+		if (this.#inFlightWakeEventKeys.has(key)) return;
+		this.#inFlightWakeEventKeys.add(key);
+		try {
+			await sink(message.wakeEvent);
+			if (this.#seenWakeEventKeys.size >= 512) {
+				const oldest = this.#seenWakeEventKeys.values().next().value;
+				if (oldest !== undefined) this.#seenWakeEventKeys.delete(oldest);
+			}
+			this.#seenWakeEventKeys.add(key);
+			this.#ackParentWake(eventId, target);
+		} catch (error) {
+			logger.warn("Parent wake sink failed", {
+				sessionId: target.sessionId,
+				eventId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this.#socket?.destroy();
+		} finally {
+			this.#inFlightWakeEventKeys.delete(key);
+		}
+	}
+
+	#ackParentWake(eventId: string, target: ParentWakeTarget): void {
+		void this.request({ op: "wake-ack", eventId, target }).catch(error => {
+			logger.warn("Parent wake ack failed", {
+				sessionId: target.sessionId,
+				eventId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 	}
 
 	#ackCompletion(completionId: string): void {

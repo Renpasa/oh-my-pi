@@ -187,7 +187,7 @@ import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
-import type { DaemonCompletionNotification } from "../launch/protocol";
+import { type DaemonCompletionNotification, parseParentWakeEvent } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -442,6 +442,12 @@ import {
 	type PrewalkCoordinatorHost,
 	type PrewalkRestartResult,
 } from "./prewalk";
+import {
+	buildParentWakeBatchMessage,
+	isParentWakeTargetSession,
+	PARENT_WAKE_MESSAGE_TYPE,
+	type ParentWakeEntry,
+} from "./parent-wake";
 import {
 	IMAGE_ATTACHMENT_DESCRIPTION_TYPE,
 	isAdvisorCard,
@@ -2605,6 +2611,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			isStale: entry =>
 				this.#isDisposed || !isLaunchCompletionOwner(entry.owner, this.sessionManager.getSessionId()),
 			build: buildLaunchCompletionBatchMessage,
+		});
+		// Dormant unless something actually calls queueParentWake — e.g. an
+		// explicit opt-in Parent Wake listener wired at CLI bootstrap (see
+		// launch/parent-wake-listener.ts). Ordinary/global OMP sessions never
+		// call it, so this registration alone changes no behavior.
+		this.yieldQueue.register<ParentWakeEntry>(PARENT_WAKE_MESSAGE_TYPE, {
+			isStale: entry => this.#isDisposed || !isParentWakeTargetSession(entry.target, this.sessionManager.getSessionId()),
+			build: buildParentWakeBatchMessage,
 		});
 		// Background-job completions / late diagnostics are pulled into the run at
 		// each step boundary as non-interrupting asides. Peer IRCs share the aside
@@ -10601,6 +10615,31 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			LAUNCH_COMPLETION_MESSAGE_TYPE,
 			notification,
 		);
+		this.yieldQueue.requestIdleFlush();
+		return delivered;
+	}
+
+	/**
+	 * Accept one broker-delivered Parent Wake event into this session's hidden
+	 * queue. The caller (an opt-in Parent Wake listener) ACKs the
+	 * transport only after this promise resolves, so an ACK durably means the
+	 * target session actually accepted the wake. Duplicate delivery of the
+	 * same `eventId` is a transport-level no-op (see `SocketDaemonClient`);
+	 * this method itself has no eventId-specific dedupe because it is never
+	 * called twice for one event by a correctly behaving transport.
+	 */
+	queueParentWake(event: ParentWakeEntry): Promise<void> {
+		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before parent wake delivery"));
+		let validated: ParentWakeEntry;
+		try {
+			validated = parseParentWakeEvent(event);
+		} catch (error) {
+			return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+		}
+		if (validated.target.sessionId !== this.sessionManager.getSessionId()) {
+			return Promise.reject(new Error("Parent wake event target does not match this session"));
+		}
+		const delivered = this.yieldQueue.enqueueWithReceipt<ParentWakeEntry>(PARENT_WAKE_MESSAGE_TYPE, validated);
 		this.yieldQueue.requestIdleFlush();
 		return delivered;
 	}

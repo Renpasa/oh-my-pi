@@ -4,7 +4,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock, IpcConnection, IpcServer, Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
-import { isEnoent, isRecord, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
+import { isEnoent, isRecord, logger, postmortem, procmgr, sanitizeText, setProcessName, toError } from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { replaceFileWithRetry } from "../utils/atomic-file";
@@ -35,10 +35,19 @@ import {
 	type DaemonRpcResult,
 	type DaemonSignal,
 	type DaemonWireRequest,
+	PARENT_WAKE_ID_PATTERN,
+	type ParentWakeDelivery,
+	type ParentWakeDispatchStatus,
+	type ParentWakeEvent,
+	type ParentWakeFailureCode,
+	type ParentWakeResult,
+	type ParentWakeTarget,
 	parseDaemonSnapshot,
 	parseDaemonSpec,
 	parseDaemonWireMessage,
 	parseDaemonWireRequest,
+	parseParentWakeEvent,
+	parseParentWakeTarget,
 } from "./protocol";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 import { renderTerminalOutput } from "./terminal-output";
@@ -63,6 +72,13 @@ const ENDPOINT_CHECK_MS = 5_000;
  * bounded over a long-lived project (issue #6517).
  */
 const MAX_TERMINAL_DAEMONS_LISTED = 10;
+const PARENT_WAKE_DIR = "parent-wake";
+const PARENT_WAKE_REGISTRATIONS_DIR = "registrations";
+const PARENT_WAKE_EVENTS_DIR = "events";
+/** Upper bound on a caller-supplied `wake-submit` `timeoutMs`, so one RPC can never hang the broker's event loop past this. */
+const MAX_WAKE_TIMEOUT_MS = 120_000;
+/** Cadence for polling a Parent Wake event's status while `wake-submit` waits for its terminal outcome. */
+const WAKE_POLL_INTERVAL_MS = 50;
 const TOKEN_FILE = "broker.token";
 const PID_FILE = "broker.pid";
 /**
@@ -126,6 +142,37 @@ interface BrokerLease {
 	path: string;
 	/** Process-owned native lock; the OS drops it however this broker exits. */
 	lock: FileLock;
+}
+
+/**
+ * A candidate/runtime's live claim on one Parent Wake `sessionId`. `socket`
+ * is the currently bound connection (undefined once it disconnects without
+ * unregistering — dispatch then fails closed with `target-dead`). `stale`
+ * is set by an explicit `wake-unregister` tombstone, distinct from an
+ * abrupt disconnect.
+ */
+interface WakeRegistration {
+	target: ParentWakeTarget;
+	socket?: IpcConnection;
+	stale: boolean;
+	registeredAt: number;
+	updatedAt: number;
+	persistQueue: Promise<void>;
+	/** Set while the latest write of this record failed; cleared by the next successful write. */
+	persistError?: Error;
+}
+
+/** Durable record of one Parent Wake event's dispatch/ACK lifecycle. */
+interface WakeEventRecord {
+	event: ParentWakeEvent;
+	status: ParentWakeDispatchStatus;
+	dispatchedAt?: number;
+	ackedAt?: number;
+	failureCode?: ParentWakeFailureCode;
+	failureMessage?: string;
+	persistQueue: Promise<void>;
+	/** Set while the latest write of this record failed; cleared by the next successful write. */
+	persistError?: Error;
 }
 
 interface DaemonLogRead {
@@ -447,6 +494,10 @@ class DaemonBroker {
 	readonly #ownerSockets = new Map<string, { socket: IpcConnection; subscriptionId: string | undefined }>();
 	readonly #completionSubscriptions = new Map<string, string | undefined>();
 	readonly #pendingCompletions = new Map<string, Map<string, DaemonCompletionNotification>>();
+	/** Live/persisted Parent Wake target registrations, keyed by `target.sessionId`. */
+	readonly #wakeRegistrations = new Map<string, WakeRegistration>();
+	/** Durable Parent Wake event records, keyed by `event.eventId`. */
+	readonly #wakeEvents = new Map<string, WakeEventRecord>();
 	readonly #finished = Promise.withResolvers<void>();
 	readonly #sockets = new Set<IpcConnection>();
 	/** Abortable `wait`/follow-`logs` requests, keyed by wire request id, so a client can cancel its own poll. */
@@ -474,6 +525,7 @@ class DaemonBroker {
 
 	async run(onListening?: () => void): Promise<void> {
 		await this.#recoverRecords();
+		await this.#recoverParentWake();
 		this.#server = await IpcServer.listen(
 			this.#endpoint,
 			{ framing: "lines", maxFrameBytes: MAX_REQUEST_BYTES },
@@ -502,6 +554,11 @@ class DaemonBroker {
 			clearTimeout(record.restartTimer);
 			await record.log?.close();
 			await record.persistQueue;
+		}
+		for (const record of this.#wakeEvents.values()) await record.persistQueue;
+		for (const registration of this.#wakeRegistrations.values()) {
+			registration.socket = undefined;
+			await registration.persistQueue;
 		}
 		this.#ownerSockets.clear();
 		for (const socket of this.#sockets) socket.destroy();
@@ -532,6 +589,9 @@ class DaemonBroker {
 				this.#scheduleIdleShutdown();
 				for (const [owner, registration] of this.#ownerSockets) {
 					if (registration.socket === socket) this.#ownerSockets.delete(owner);
+				}
+				for (const registration of this.#wakeRegistrations.values()) {
+					if (registration.socket === socket) registration.socket = undefined;
 				}
 				// Nobody can read these answers any more; stop polling for them.
 				for (const [requestId, inFlight] of this.#inFlight) {
@@ -687,6 +747,14 @@ class DaemonBroker {
 			}
 			case "shutdown":
 				return { op: "shutdown" };
+			case "wake-register":
+				return this.#wakeRegister(operation.target, socket);
+			case "wake-unregister":
+				return this.#wakeUnregister(operation.target);
+			case "wake-submit":
+				return this.#wakeSubmit(operation.event, operation.timeoutMs);
+			case "wake-ack":
+				return this.#wakeAck(operation.eventId, operation.target);
 		}
 	}
 
@@ -1487,7 +1555,9 @@ class DaemonBroker {
 						if ("pendingCompletions" in decoded && Array.isArray(decoded.pendingCompletions)) {
 							return decoded.pendingCompletions.map(value => {
 								const message = parseDaemonWireMessage(value);
-								if (!("event" in message)) throw new Error("Pending daemon completion is not an event");
+								if (!("event" in message) || message.event !== "daemon-completed") {
+									throw new Error("Pending daemon completion is not a completion event");
+								}
 								return message;
 							});
 						}
@@ -1542,6 +1612,353 @@ class DaemonBroker {
 			} catch (error) {
 				logger.warn("Failed to recover daemon record", {
 					name: entry.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------
+	// Parent Wake Transport v1
+	// -------------------------------------------------------------------
+
+	#validateWakeTarget(target: ParentWakeTarget): void {
+		if (target.projectDir !== this.#projectDir) {
+			throw new Error("Parent wake target.projectDir does not match this broker's scope");
+		}
+	}
+
+	/** Bind the calling socket as the live sink for `target.sessionId`, then flush any unacked dispatch. */
+	async #wakeRegister(target: ParentWakeTarget, socket: IpcConnection): Promise<DaemonRpcResult> {
+		this.#validateWakeTarget(target);
+		const existing = this.#wakeRegistrations.get(target.sessionId);
+		// A different runtime scope is rejected whenever a non-stale registration
+		// exists, even if its socket already dropped without an explicit
+		// wake-unregister: an abrupt disconnect is not consent to hand the
+		// session id to a different runtime scope, and allowing it here would
+		// let a transient disconnect hijack (or lock out) the real owner.
+		if (existing && !existing.stale && existing.socket !== socket && existing.target.runtimeScope !== target.runtimeScope) {
+			throw new Error(
+				`Parent wake session ${target.sessionId} is already registered under a different runtime scope`,
+			);
+		}
+		const now = Date.now();
+		const registration: WakeRegistration = {
+			target,
+			socket,
+			stale: false,
+			registeredAt: existing?.registeredAt ?? now,
+			updatedAt: now,
+			persistQueue: existing?.persistQueue ?? Promise.resolve(),
+		};
+		this.#wakeRegistrations.set(target.sessionId, registration);
+		this.#persistWakeRegistration(registration);
+		await registration.persistQueue;
+		if (registration.persistError) {
+			// A registration that is not durably recorded must not accept wakes: fail closed and restore the prior state.
+			if (existing) this.#wakeRegistrations.set(target.sessionId, existing);
+			else this.#wakeRegistrations.delete(target.sessionId);
+			throw new Error(`Parent wake registration for ${target.sessionId} could not be durably recorded`);
+		}
+		this.#redeliverPendingWakes(target.sessionId);
+		return { op: "wake-register", target };
+	}
+
+	/** Tombstone `target.sessionId`'s registration — an explicit, graceful opt-out distinct from an abrupt disconnect. */
+	async #wakeUnregister(target: ParentWakeTarget): Promise<DaemonRpcResult> {
+		this.#validateWakeTarget(target);
+		const existing = this.#wakeRegistrations.get(target.sessionId);
+		if (existing && existing.target.runtimeScope === target.runtimeScope) {
+			existing.stale = true;
+			existing.socket = undefined;
+			existing.updatedAt = Date.now();
+			this.#persistWakeRegistration(existing);
+			await existing.persistQueue;
+		}
+		return { op: "wake-unregister", target };
+	}
+
+	/** Re-push every still-`dispatched` (unacked) event for `sessionId` to its freshly bound socket. */
+	#redeliverPendingWakes(sessionId: string): void {
+		const registration = this.#wakeRegistrations.get(sessionId);
+		if (!registration?.socket || registration.socket.closed) return;
+		for (const record of this.#wakeEvents.values()) {
+			if (record.event.target.sessionId !== sessionId || record.status !== "dispatched") continue;
+			registration.socket.send(
+				JSON.stringify({ event: "parent-wake", wakeEvent: record.event } satisfies ParentWakeDelivery),
+			);
+		}
+	}
+
+	/**
+	 * Persist an event record, then attempt exactly one dispatch, before the
+	 * caller sees any result — satisfies "persist before dispatch". Fails
+	 * closed (durably, immediately) for a target that is missing, dead,
+	 * stale, or registered under a different runtime scope.
+	 */
+	async #attemptWakeDispatch(record: WakeEventRecord): Promise<void> {
+		const target = record.event.target;
+		const registration = this.#wakeRegistrations.get(target.sessionId);
+		if (!registration) {
+			record.status = "failed";
+			record.failureCode = "target-missing";
+			record.failureMessage = `No Parent wake target is registered for session ${target.sessionId}`;
+		} else if (registration.stale) {
+			record.status = "failed";
+			record.failureCode = "target-stale";
+			record.failureMessage = `Parent wake target ${target.sessionId} unregistered`;
+		} else if (registration.target.runtimeScope !== target.runtimeScope) {
+			record.status = "failed";
+			record.failureCode = "wrong-target";
+			record.failureMessage = `Parent wake target ${target.sessionId} is registered under a different runtime scope`;
+		} else if (!registration.socket || registration.socket.closed) {
+			record.status = "failed";
+			record.failureCode = "target-dead";
+			record.failureMessage = `Parent wake target ${target.sessionId} has no live connection`;
+		} else {
+			record.status = "dispatched";
+			record.dispatchedAt = Date.now();
+			this.#persistWakeEvent(record);
+			await record.persistQueue;
+			if (record.persistError) await this.#discardUnrecordedWake(record);
+			// Re-check: the target may have gone away while the record was being written.
+			if (registration.socket && !registration.socket.closed) {
+				registration.socket.send(
+					JSON.stringify({ event: "parent-wake", wakeEvent: record.event } satisfies ParentWakeDelivery),
+				);
+			} else {
+				record.status = "failed";
+				record.failureCode = "target-dead";
+				record.failureMessage = `Parent wake target ${target.sessionId} has no live connection`;
+				this.#persistWakeEvent(record);
+				await record.persistQueue;
+			}
+			return;
+		}
+		this.#persistWakeEvent(record);
+		await record.persistQueue;
+	}
+
+	/**
+	 * Fail closed when an event could not be durably recorded: forget it (so it can be resubmitted),
+	 * best-effort remove any earlier on-disk state, and reject the request without dispatching.
+	 */
+	async #discardUnrecordedWake(record: WakeEventRecord): Promise<never> {
+		this.#wakeEvents.delete(record.event.eventId);
+		const file = path.join(this.#runtimeDir, PARENT_WAKE_DIR, PARENT_WAKE_EVENTS_DIR, `${record.event.eventId}.json`);
+		await fs.rm(file, { force: true }).catch(() => undefined);
+		throw new Error(`Parent wake event ${record.event.eventId} could not be durably recorded; it was not dispatched`);
+	}
+
+	/**
+	 * Submit one durable wake event. `eventId` is the dedupe key: a replay
+	 * (duplicate request, or after a broker restart) returns the already
+	 * persisted result unchanged rather than dispatching a second wake. A
+	 * fresh event blocks up to `timeoutMs` for a terminal outcome (acked or
+	 * timed out) before returning.
+	 */
+	async #wakeSubmit(event: ParentWakeEvent, timeoutMs: number): Promise<DaemonRpcResult> {
+		this.#validateWakeTarget(event.target);
+		const existing = this.#wakeEvents.get(event.eventId);
+		if (existing) {
+			if (
+				existing.event.target.sessionId !== event.target.sessionId ||
+				existing.event.target.runtimeScope !== event.target.runtimeScope ||
+				existing.event.target.projectDir !== event.target.projectDir
+			) {
+				throw new Error(
+					`Parent wake event ${event.eventId} was already submitted for a different target; it never inherits another target's result`,
+				);
+			}
+			return { op: "wake-submit", result: this.#wakeResult(existing) };
+		}
+		const record: WakeEventRecord = { event, status: "pending", persistQueue: Promise.resolve() };
+		this.#wakeEvents.set(event.eventId, record);
+		this.#persistWakeEvent(record);
+		await record.persistQueue;
+		if (record.persistError) await this.#discardUnrecordedWake(record);
+		await this.#attemptWakeDispatch(record);
+		if (record.status === "dispatched") {
+			const bound = Math.max(0, Math.min(timeoutMs, MAX_WAKE_TIMEOUT_MS));
+			const deadline = Date.now() + bound;
+			while (record.status === "dispatched" && Date.now() < deadline) {
+				await Bun.sleep(WAKE_POLL_INTERVAL_MS);
+			}
+			if (record.status === "dispatched") {
+				record.status = "failed";
+				record.failureCode = "timeout";
+				record.failureMessage = "Parent wake target did not acknowledge before the timeout elapsed";
+				this.#persistWakeEvent(record);
+				await record.persistQueue;
+			}
+		}
+		return { op: "wake-submit", result: this.#wakeResult(record) };
+	}
+
+	/**
+	 * Acknowledge one dispatched event. Idempotent — acking an already-acked
+	 * event is a no-op. A dispatch the submitter already saw time out can
+	 * still land a genuine late ack moments afterward (the sink accepted it,
+	 * just past the submitter's bound); that true terminal outcome overwrites
+	 * the stale "timeout" failure rather than being silently discarded, so a
+	 * replay of the same eventId reports "acked" instead of a phantom timeout.
+	 * Every other terminal failure (target-missing/-dead/-stale/wrong-target)
+	 * still rejects the ack unchanged — those mean no live sink ever received
+	 * this dispatch, so an ack for them cannot be genuine.
+	 */
+	async #wakeAck(eventId: string, target: ParentWakeTarget): Promise<DaemonRpcResult> {
+		this.#validateWakeTarget(target);
+		const record = this.#wakeEvents.get(eventId);
+		if (!record) throw new Error(`Unknown parent wake event ${eventId}`);
+		if (record.event.target.sessionId !== target.sessionId || record.event.target.runtimeScope !== target.runtimeScope) {
+			throw new Error(`Parent wake event ${eventId} does not belong to the acknowledging target`);
+		}
+		if (record.status === "acked") return { op: "wake-ack", result: this.#wakeResult(record) };
+		const lateAfterTimeout = record.status === "failed" && record.failureCode === "timeout";
+		if (record.status !== "dispatched" && !lateAfterTimeout) {
+			throw new Error(`Parent wake event ${eventId} is not awaiting acknowledgement (status: ${record.status})`);
+		}
+		record.status = "acked";
+		record.ackedAt = Date.now();
+		record.failureCode = undefined;
+		record.failureMessage = undefined;
+		this.#persistWakeEvent(record);
+		await record.persistQueue;
+		return { op: "wake-ack", result: this.#wakeResult(record) };
+	}
+
+	#wakeResult(record: WakeEventRecord): ParentWakeResult {
+		return {
+			eventId: record.event.eventId,
+			target: record.event.target,
+			status: record.status,
+			dispatchedAt: record.dispatchedAt,
+			ackedAt: record.ackedAt,
+			failureCode: record.failureCode,
+			failureMessage: record.failureMessage,
+		};
+	}
+
+	#persistWakeEvent(record: WakeEventRecord): void {
+		const dir = path.join(this.#runtimeDir, PARENT_WAKE_DIR, PARENT_WAKE_EVENTS_DIR);
+		const metaPath = path.join(dir, `${record.event.eventId}.json`);
+		const metadata = {
+			event: record.event,
+			status: record.status,
+			dispatchedAt: record.dispatchedAt,
+			ackedAt: record.ackedAt,
+			failureCode: record.failureCode,
+			failureMessage: record.failureMessage,
+		};
+		record.persistQueue = record.persistQueue
+			.then(async () => {
+				await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+				await writeFileAtomic(metaPath, JSON.stringify(metadata));
+				record.persistError = undefined;
+			})
+			.catch(error => {
+				record.persistError = toError(error);
+				logger.warn("Failed to persist parent wake event", {
+					eventId: record.event.eventId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	}
+
+	#persistWakeRegistration(registration: WakeRegistration): void {
+		const dir = path.join(this.#runtimeDir, PARENT_WAKE_DIR, PARENT_WAKE_REGISTRATIONS_DIR);
+		const metaPath = path.join(dir, `${registration.target.sessionId}.json`);
+		const metadata = {
+			target: registration.target,
+			stale: registration.stale,
+			registeredAt: registration.registeredAt,
+			updatedAt: registration.updatedAt,
+		};
+		registration.persistQueue = registration.persistQueue
+			.then(async () => {
+				await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+				await writeFileAtomic(metaPath, JSON.stringify(metadata));
+				registration.persistError = undefined;
+			})
+			.catch(error => {
+				registration.persistError = toError(error);
+				logger.warn("Failed to persist parent wake registration", {
+					sessionId: registration.target.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	}
+
+	/** Recover Parent Wake registrations and events from a prior broker lifetime. No sockets are live yet — a target must re-register (opt in again) before any pending event redelivers. */
+	async #recoverParentWake(): Promise<void> {
+		await this.#recoverWakeRegistrations();
+		await this.#recoverWakeEvents();
+	}
+
+	async #recoverWakeRegistrations(): Promise<void> {
+		const dir = path.join(this.#runtimeDir, PARENT_WAKE_DIR, PARENT_WAKE_REGISTRATIONS_DIR);
+		const entries = await fs.readdir(dir, { withFileTypes: true }).catch(error => {
+			if (isEnoent(error)) return [];
+			throw error;
+		});
+		for (const entry of entries) {
+			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			try {
+				const decoded: unknown = await Bun.file(path.join(dir, entry.name)).json();
+				const source = decoded as Record<string, unknown>;
+				const target = parseParentWakeTarget(source.target);
+				const registration: WakeRegistration = {
+					target,
+					socket: undefined,
+					stale: source.stale === true,
+					registeredAt: typeof source.registeredAt === "number" ? source.registeredAt : Date.now(),
+					updatedAt: typeof source.updatedAt === "number" ? source.updatedAt : Date.now(),
+					persistQueue: Promise.resolve(),
+				};
+				this.#wakeRegistrations.set(target.sessionId, registration);
+			} catch (error) {
+				logger.warn("Failed to recover parent wake registration", {
+					file: entry.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
+	async #recoverWakeEvents(): Promise<void> {
+		const dir = path.join(this.#runtimeDir, PARENT_WAKE_DIR, PARENT_WAKE_EVENTS_DIR);
+		const entries = await fs.readdir(dir, { withFileTypes: true }).catch(error => {
+			if (isEnoent(error)) return [];
+			throw error;
+		});
+		for (const entry of entries) {
+			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			try {
+				const decoded: unknown = await Bun.file(path.join(dir, entry.name)).json();
+				const source = decoded as Record<string, unknown>;
+				const event = parseParentWakeEvent(source.event);
+				const record: WakeEventRecord = {
+					event,
+					status:
+						source.status === "pending" ||
+						source.status === "dispatched" ||
+						source.status === "acked" ||
+						source.status === "failed"
+							? source.status
+							: "failed",
+					dispatchedAt: typeof source.dispatchedAt === "number" ? source.dispatchedAt : undefined,
+					ackedAt: typeof source.ackedAt === "number" ? source.ackedAt : undefined,
+					failureCode:
+						typeof source.failureCode === "string"
+							? (source.failureCode as ParentWakeFailureCode)
+							: undefined,
+					failureMessage: typeof source.failureMessage === "string" ? source.failureMessage : undefined,
+					persistQueue: Promise.resolve(),
+				};
+				this.#wakeEvents.set(event.eventId, record);
+			} catch (error) {
+				logger.warn("Failed to recover parent wake event", {
+					file: entry.name,
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}

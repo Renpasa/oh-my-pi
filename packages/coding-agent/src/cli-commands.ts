@@ -53,6 +53,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.authGatewayHelp,
 	},
 	{
+		name: "parent-wake",
+		load: () => import("./commands/parent-wake").then(m => m.default),
+		help: commandHelp.parentWakeHelp,
+	},
+	{
 		name: "agents",
 		load: () => import("./commands/agents").then(m => m.default),
 		help: commandHelp.agentsHelp,
