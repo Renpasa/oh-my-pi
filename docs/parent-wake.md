@@ -50,13 +50,28 @@ never produce a result line.
   `target-stale` (explicitly unregistered), `wrong-target`, `timeout`. Malformed events are rejected as request errors.
 - **Replay-safe:** `event_id` is the dedupe key. A resubmission returns the persisted result and never wakes
   twice; an `event_id` already used for a different target is rejected.
+- **Connection-bound ACK/unregister:** only the connection that owns a target's live registration can acknowledge
+  its deliveries or unregister it; another client with the same runtime-dir token is rejected without any state change.
 - **Honest ACK:** the broker records `acked` only after the target session has injected the wake into its own
   queue. A session that rejects it (invalid, other session id, disposed) never acknowledges.
+- **Live owner wins:** another connection cannot register a session id that a live connection holds, whatever
+  runtime scope it names; a dead owner may be replaced by the same scope.
+- **Once in the session:** the injected wake message records its event id in the session history, so a wake the
+  session already accepted is acknowledged again — never injected twice — when the broker redelivers it after a
+  lost ACK or restart.
+- **Acknowledged means durable:** an ACK the broker cannot write to disk is rejected and the event stays
+  unacknowledged. An event that cannot be written is not dispatched. Recovered unfinished events resume when the
+  target re-registers (`pending` ones are dispatched then) or settle to a terminal `target-*`/`timeout` result when a
+  submitter replays them; none stays pending.
+- **Bounded retention:** terminal events and registrations are kept for 14 days (replay identity is durable within
+  that horizon) and older records are deleted when the broker starts; only the 256 newest terminal records stay in
+  memory, the rest are read from disk on demand.
 - **Persist before dispatch:** events and registrations are stored under `<runtime-dir>/parent-wake/` and survive
   a broker restart; a still-unacknowledged dispatch is redelivered when the target re-registers.
 
 ## Isolation
 
-`--runtime-dir` / `OMP_PARENT_WAKE_BROKER_RUNTIME_DIR` must be absolute and outside the profile's
-`run/daemons` root, so the isolated broker can neither join a live shared broker nor sit among the scopes the
-dead-scope sweep reclaims. Submitter and target must name the same directory.
+`--runtime-dir` / `OMP_PARENT_WAKE_BROKER_RUNTIME_DIR` must be absolute, contain no `..` segment or symlinked
+component, and resolve neither inside nor above the profile's `run/daemons` root, so the isolated broker can
+neither join a live shared broker nor sit among the scopes the dead-scope sweep reclaims. Submitter and target
+must name the same directory.

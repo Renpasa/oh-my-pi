@@ -16,7 +16,7 @@
  */
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import { createDaemonBrokerClient, type DaemonBrokerClient, daemonClientForProject } from "./client";
-import { assertPrivateRuntimeDir } from "./paths";
+import { resolvePrivateRuntimeDir } from "./paths";
 import {
 	PARENT_WAKE_BROKER_RUNTIME_DIR_ENV,
 	PARENT_WAKE_TARGET_RUNTIME_SCOPE_ENV,
@@ -51,8 +51,8 @@ export function resolveParentWakeTargetFromEnvironment(projectDir: string): Pare
 async function connectWakeBroker(projectDir: string): Promise<{ client: DaemonBrokerClient; owned: boolean }> {
 	const runtimeDir = process.env[PARENT_WAKE_BROKER_RUNTIME_DIR_ENV];
 	if (!runtimeDir) return { client: await daemonClientForProject(projectDir), owned: false };
-	assertPrivateRuntimeDir(runtimeDir, PARENT_WAKE_BROKER_RUNTIME_DIR_ENV);
-	return { client: await createDaemonBrokerClient(projectDir, { runtimeDir }), owned: true };
+	const privateRuntimeDir = await resolvePrivateRuntimeDir(runtimeDir, PARENT_WAKE_BROKER_RUNTIME_DIR_ENV);
+	return { client: await createDaemonBrokerClient(projectDir, { runtimeDir: privateRuntimeDir }), owned: true };
 }
 
 /**

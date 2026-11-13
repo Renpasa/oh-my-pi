@@ -40,3 +40,10 @@ export function buildParentWakeBatchMessage(entries: ParentWakeEntry[]): CustomM
 		timestamp: Date.now(),
 	};
 }
+
+/** Whether a persisted session entry is the injected wake message that carries `eventId`. */
+export function entryCarriesParentWake(entry: { type: string; customType?: string; details?: unknown }, eventId: string): boolean {
+	if (entry.type !== "custom_message" || entry.customType !== PARENT_WAKE_MESSAGE_TYPE) return false;
+	const events = (entry.details as { events?: unknown } | undefined)?.events;
+	return Array.isArray(events) && events.some(item => (item as { eventId?: unknown } | null)?.eventId === eventId);
+}

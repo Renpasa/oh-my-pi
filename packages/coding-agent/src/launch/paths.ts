@@ -82,17 +82,61 @@ export async function readStoredDaemonRecord(dir: string): Promise<StoredDaemonR
 	return { meta, spec, legacyLayout: false };
 }
 
+/** Canonicalize `target` through its deepest existing ancestor; the not-yet-created tail is appended as given. */
+async function canonicalAllowingMissing(target: string): Promise<string> {
+	const tail: string[] = [];
+	let current = path.resolve(target);
+	for (;;) {
+		try {
+			return path.join(await fs.realpath(current), ...tail);
+		} catch (error) {
+			const parent = path.dirname(current);
+			if (!isEnoent(error) || parent === current) throw error;
+			tail.unshift(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
 /**
  * Validate a caller-chosen broker runtime directory meant to isolate one broker from the shared
- * per-project scopes: it must be absolute and outside this profile's daemon runtime root, so it can
- * neither join a live shared broker nor sit among the siblings the dead-scope sweep reclaims.
+ * per-project scopes, returning the directory to use. It must be absolute, contain no `..` segment,
+ * and have no symlinked component; its canonical location must be neither inside this profile's
+ * daemon runtime root nor an ancestor of it. That keeps an isolated broker from joining a live
+ * shared broker or sitting among the sibling scopes `pruneDeadDaemonRuntimeDirs` reclaims, however
+ * the path is spelled.
  */
-export function assertPrivateRuntimeDir(runtimeDir: string, label: string): void {
+export async function resolvePrivateRuntimeDir(runtimeDir: string, label: string): Promise<string> {
 	if (!path.isAbsolute(runtimeDir)) throw new Error(`${label} must be an absolute path`);
-	const relative = path.relative(getDaemonRuntimeRoot(), path.resolve(runtimeDir));
-	if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
-		throw new Error(`${label} must not be inside the shared daemon runtime root ${getDaemonRuntimeRoot()}`);
+	if (runtimeDir.split(/[\\/]/).includes("..")) throw new Error(`${label} must not contain '..' segments`);
+	const resolved = path.resolve(runtimeDir);
+	const { root } = path.parse(resolved);
+	let current = root;
+	for (const part of resolved.slice(root.length).split(path.sep).filter(Boolean)) {
+		current = path.join(current, part);
+		let stat: Awaited<ReturnType<typeof fs.lstat>>;
+		try {
+			stat = await fs.lstat(current);
+		} catch (error) {
+			if (isEnoent(error)) break; // the rest does not exist yet; the broker creates it
+			throw error;
+		}
+		if (stat.isSymbolicLink()) throw new Error(`${label} must not contain symlinked components: ${current}`);
 	}
+	const canonical = await canonicalAllowingMissing(resolved);
+	const sharedRoot = await canonicalAllowingMissing(getDaemonRuntimeRoot());
+	const inside = (parent: string, child: string): boolean => {
+		const relative = path.relative(parent, child);
+		const escapes = relative === ".." || relative.startsWith(`..${path.sep}`);
+		return relative === "" || (!escapes && !path.isAbsolute(relative));
+	};
+	if (inside(sharedRoot, canonical)) {
+		throw new Error(`${label} must not be inside the shared daemon runtime root ${sharedRoot}`);
+	}
+	if (inside(canonical, sharedRoot)) {
+		throw new Error(`${label} must not contain the shared daemon runtime root ${sharedRoot}`);
+	}
+	return canonical;
 }
 
 /** Resolve the Unix socket or Windows named pipe used by one daemon broker scope. */

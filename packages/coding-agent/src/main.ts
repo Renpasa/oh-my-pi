@@ -156,7 +156,7 @@ import { cfgGoalEnabled } from "./goals/settings";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "./plan-mode/settings";
 
 import { cfgAdvisorEnabled } from "./advisor/settings";
-import { cfgAsyncPrintWake, cfgLaunchPersist, cfgToolsApprovalMode } from "./tools/settings";
+import { cfgAsyncPrintWake, cfgCheckpointEnabled, cfgLaunchPersist, cfgToolsApprovalMode } from "./tools/settings";
 import { claimTerminal } from "./tools/browser/terminal-owner";
 import {
 	cfgAutocompleteMaxVisible,
@@ -1815,6 +1815,19 @@ export async function buildSessionOptions(
 		}
 	}
 
+	// --strict-tools registers exactly the --tools list: the SDK ignores extensions, so main must not
+	// discover or execute any either (ambient, explicit, or trusted) before handing off to it.
+	if (parsed.strictTools) {
+		options.disableExtensionDiscovery = true;
+		options.additionalExtensionPaths = [];
+		// The SDK pairs `checkpoint` with `rewind` by adding the missing one; an exact list must not be
+		// widened behind the caller's back, so a one-sided pair is refused instead.
+		const listed = parsed.tools ?? [];
+		if (cfgCheckpointEnabled.get(activeSettings) && listed.includes("checkpoint") !== listed.includes("rewind")) {
+			throw new CliUsageError("--strict-tools requires --tools to name both `checkpoint` and `rewind` together");
+		}
+	}
+
 	return options;
 }
 
@@ -2510,7 +2523,7 @@ export async function runRootCommand(
 			// string-flag value such as `--target @notes.md` is the flag's value, not a
 			// file — and the same result is handed to createAgentSession via
 			// `preloadedExtensions` so the discovery work is not repeated.
-			if (isInteractive && !parsedArgs.trustedExtensions?.length) {
+			if (isInteractive && !parsedArgs.trustedExtensions?.length && !parsedArgs.strictTools) {
 				startupExtensions = sessionOptions.extensions = [
 					...(sessionOptions.extensions ?? []),
 					createWarpEventBridgeExtension(),

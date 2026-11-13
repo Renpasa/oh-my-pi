@@ -42,7 +42,7 @@
 
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../launch/client";
-import { assertPrivateRuntimeDir, canonicalProjectDir } from "../launch/paths";
+import { canonicalProjectDir, resolvePrivateRuntimeDir } from "../launch/paths";
 import type { ParentWakeEvent, ParentWakePointer, ParentWakeResult } from "../launch/protocol";
 
 export interface ParentWakeCommandArgs {
@@ -220,11 +220,11 @@ export async function runParentWakeCommand(cmd: ParentWakeCommandArgs): Promise<
 	const timeoutMs = cmd.flags.timeout ?? DEFAULT_WAKE_TIMEOUT_MS;
 	let client: DaemonBrokerClient;
 	try {
-		if (cmd.flags.runtimeDir !== undefined) assertPrivateRuntimeDir(cmd.flags.runtimeDir, "--runtime-dir");
-		client = await createDaemonBrokerClient(
-			projectDir,
-			cmd.flags.runtimeDir === undefined ? {} : { runtimeDir: cmd.flags.runtimeDir },
-		);
+		const runtimeDir =
+			cmd.flags.runtimeDir === undefined
+				? undefined
+				: await resolvePrivateRuntimeDir(cmd.flags.runtimeDir, "--runtime-dir");
+		client = await createDaemonBrokerClient(projectDir, runtimeDir === undefined ? {} : { runtimeDir });
 	} catch (error) {
 		process.stderr.write(
 			`omp parent-wake: failed to connect to the daemon broker: ${error instanceof Error ? error.message : String(error)}\n`,

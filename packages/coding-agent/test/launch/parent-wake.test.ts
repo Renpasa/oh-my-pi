@@ -5,7 +5,7 @@ import { getDaemonRuntimeRoot, TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
 import * as daemonClient from "../../src/launch/client";
-import { assertPrivateRuntimeDir } from "../../src/launch/paths";
+import { resolvePrivateRuntimeDir } from "../../src/launch/paths";
 import {
 	resolveParentWakeTargetFromEnvironment,
 	startParentWakeListenerFromEnvironment,
@@ -432,6 +432,8 @@ describe("parent wake transport", () => {
 		const broker = startBroker(projectDir, runtimeDir);
 		try {
 			const wakeTargetA: ParentWakeTarget = { projectDir, sessionId: "parent-a", runtimeScope: "candidate-a" };
+			// Land the registration before submitting: onParentWake registers asynchronously.
+			await targetA.request({ op: "wake-register", target: wakeTargetA });
 			targetA.onParentWake(wakeTargetA, () => {});
 			const first = await caller.request({
 				op: "wake-submit",
@@ -764,13 +766,40 @@ describe("parent wake transport", () => {
 		}
 	}, 20_000);
 
-	it("refuses a relative or shared-root runtime dir for the isolated broker", async () => {
-		expect(() => assertPrivateRuntimeDir("relative/run", "runtime dir")).toThrow("absolute");
-		expect(() => assertPrivateRuntimeDir(path.join(getDaemonRuntimeRoot(), "0123456789abcdef"), "runtime dir")).toThrow(
+	it("refuses relative, shared-root, symlinked and dot-dot runtime dirs for the isolated broker", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-private-dir-");
+		const sharedRoot = getDaemonRuntimeRoot();
+		await fs.mkdir(sharedRoot, { recursive: true });
+		const real = path.join(tempDir.path(), "real");
+		await fs.mkdir(real);
+		const linkToRoot = path.join(tempDir.path(), "link-to-root");
+		await fs.symlink(sharedRoot, linkToRoot, "dir");
+		const linkToReal = path.join(tempDir.path(), "link-to-real");
+		await fs.symlink(real, linkToReal, "dir");
+
+		await expect(resolvePrivateRuntimeDir("relative/run", "runtime dir")).rejects.toThrow("absolute");
+		await expect(
+			resolvePrivateRuntimeDir(path.join(sharedRoot, "0123456789abcdef"), "runtime dir"),
+		).rejects.toThrow("shared daemon runtime root");
+		// An ancestor of the shared root would put the isolated broker's files beside it.
+		await expect(resolvePrivateRuntimeDir(path.dirname(sharedRoot), "runtime dir")).rejects.toThrow(
 			"shared daemon runtime root",
 		);
-		using tempDir = TempDir.createSync("@omp-parent-wake-private-dir-");
-		expect(() => assertPrivateRuntimeDir(path.join(tempDir.path(), "run"), "runtime dir")).not.toThrow();
+		// Symlink escapes: into the shared root, and an innocuous symlink component.
+		await expect(resolvePrivateRuntimeDir(path.join(linkToRoot, "0123456789abcdef"), "runtime dir")).rejects.toThrow(
+			"symlinked",
+		);
+		await expect(resolvePrivateRuntimeDir(path.join(linkToReal, "run"), "runtime dir")).rejects.toThrow("symlinked");
+		// Dot-dot escapes that normalise into the shared root.
+		await expect(
+			resolvePrivateRuntimeDir(path.join(real, "child", "..", "..", "link-to-root", "x"), "runtime dir"),
+		).rejects.toThrow();
+		await expect(
+			resolvePrivateRuntimeDir(`${sharedRoot}${path.sep}child${path.sep}..${path.sep}0123456789abcdef`, "runtime dir"),
+		).rejects.toThrow("'..'");
+
+		const accepted = await resolvePrivateRuntimeDir(path.join(real, "run"), "runtime dir");
+		expect(accepted).toBe(path.join(await fs.realpath(real), "run"));
 
 		const previousSessionId = process.env[PARENT_WAKE_TARGET_SESSION_ID_ENV];
 		const previousRuntimeScope = process.env[PARENT_WAKE_TARGET_RUNTIME_SCOPE_ENV];
@@ -858,6 +887,274 @@ describe("parent wake transport", () => {
 			expect(received).toHaveLength(deliveredBefore);
 		} finally {
 			await stopBroker([caller, target], caller, broker);
+		}
+	}, 20_000);
+	it("rejects an ack forged by another client holding the same token, leaving the event unacknowledged", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-forged-ack-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const caller = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const target = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			// Matching projectDir + sessionId + runtimeScope: only the connection differs.
+			const wakeTarget: ParentWakeTarget = { projectDir, sessionId: "parent-forged-ack", runtimeScope: "candidate-a" };
+			// Raw registration with no sink: the real target never acknowledges.
+			await target.request({ op: "wake-register", target: wakeTarget });
+			const submitPromise = caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-forged-ack-1"),
+				timeoutMs: 1_500,
+			});
+			// Wait for the real dispatch before forging, so the ack targets a genuinely dispatched event.
+			const eventFile = path.join(runtimeDir, "parent-wake", "events", "evt-forged-ack-1.json");
+			await waitFor(async () => {
+				try {
+					const decoded: unknown = JSON.parse(await fs.readFile(eventFile, "utf8"));
+					return typeof decoded === "object" && decoded !== null && "status" in decoded && decoded.status === "dispatched";
+				} catch {
+					return false;
+				}
+			});
+			let rejected: unknown;
+			try {
+				await caller.request({ op: "wake-ack", eventId: "evt-forged-ack-1", target: wakeTarget });
+			} catch (error) {
+				rejected = error;
+			}
+			expect(rejected).toBeInstanceOf(Error);
+			expect((rejected as Error).message).toContain("does not own");
+
+			const submitted = await submitPromise;
+			if (submitted.op !== "wake-submit") throw new Error("unexpected op");
+			expect(submitted.result.status).toBe("failed");
+			expect(submitted.result.failureCode).toBe("timeout");
+			expect(submitted.result.ackedAt).toBeUndefined();
+
+			// The registering connection's own ack still lands.
+			const genuine = await target.request({ op: "wake-ack", eventId: "evt-forged-ack-1", target: wakeTarget });
+			if (genuine.op !== "wake-ack") throw new Error("unexpected op");
+			expect(genuine.result.status).toBe("acked");
+		} finally {
+			await stopBroker([caller, target], caller, broker);
+		}
+	}, 20_000);
+
+	it("rejects an unregister forged by another client holding the same token, leaving the registration live", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-forged-unregister-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const caller = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const target = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			const wakeTarget: ParentWakeTarget = { projectDir, sessionId: "parent-forged-unreg", runtimeScope: "candidate-a" };
+			const received: ParentWakeEvent[] = [];
+			target.onParentWake(wakeTarget, wakeEvent => {
+				received.push(wakeEvent);
+			});
+			// Registration is fire-and-forget: wait until a probe actually dispatches and is acked.
+			await waitFor(async () => {
+				const probe = await caller.request({
+					op: "wake-submit",
+					event: event(wakeTarget, `evt-forged-unreg-probe-${crypto.randomUUID()}`),
+					timeoutMs: 2_000,
+				});
+				return probe.op === "wake-submit" && probe.result.status === "acked";
+			});
+
+			let rejected: unknown;
+			try {
+				await caller.request({ op: "wake-unregister", target: wakeTarget });
+			} catch (error) {
+				rejected = error;
+			}
+			expect(rejected).toBeInstanceOf(Error);
+			expect((rejected as Error).message).toContain("does not own");
+
+			// Not tombstoned: the real target still receives and acknowledges a fresh wake.
+			const before = received.length;
+			const result = await caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-forged-unreg-after"),
+				timeoutMs: 5_000,
+			});
+			if (result.op !== "wake-submit") throw new Error("unexpected op");
+			expect(result.result.status).toBe("acked");
+			expect(received).toHaveLength(before + 1);
+		} finally {
+			await stopBroker([caller, target], caller, broker);
+		}
+	}, 20_000);
+	it("lets a live registration owner win: another client cannot take over the same session id, even under the same scope", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-live-owner-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const caller = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const owner = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const impostor = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			const wakeTarget: ParentWakeTarget = { projectDir, sessionId: "parent-live-owner", runtimeScope: "candidate-a" };
+			const ownerReceived: ParentWakeEvent[] = [];
+			await owner.request({ op: "wake-register", target: wakeTarget });
+			owner.onParentWake(wakeTarget, wakeEvent => {
+				ownerReceived.push(wakeEvent);
+			});
+
+			let rejected: unknown;
+			try {
+				await impostor.request({ op: "wake-register", target: wakeTarget });
+			} catch (error) {
+				rejected = error;
+			}
+			expect(rejected).toBeInstanceOf(Error);
+			expect((rejected as Error).message).toContain("already registered");
+
+			const result = await caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-live-owner-1"),
+				timeoutMs: 5_000,
+			});
+			if (result.op !== "wake-submit") throw new Error("unexpected op");
+			expect(result.result.status).toBe("acked");
+			expect(ownerReceived.map(item => item.eventId)).toEqual(["evt-live-owner-1"]);
+
+			// Once the owner is gone, the same scope may take the registration over.
+			owner.close();
+			await waitFor(async () => {
+				try {
+					await impostor.request({ op: "wake-register", target: wakeTarget });
+					return true;
+				} catch {
+					return false;
+				}
+			});
+		} finally {
+			await stopBroker([caller, impostor], caller, broker);
+		}
+	}, 20_000);
+
+	it("does not report acked when the acknowledgement cannot be durably recorded", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-ack-persist-fail-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const caller = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const target = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			const wakeTarget: ParentWakeTarget = { projectDir, sessionId: "parent-ack-persist", runtimeScope: "candidate-a" };
+			await target.request({ op: "wake-register", target: wakeTarget });
+			const submitPromise = caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-ack-persist-1"),
+				timeoutMs: 1_000,
+			});
+			const eventsDir = path.join(runtimeDir, "parent-wake", "events");
+			const eventFile = path.join(eventsDir, "evt-ack-persist-1.json");
+			await waitFor(async () => {
+				try {
+					const decoded: unknown = JSON.parse(await fs.readFile(eventFile, "utf8"));
+					return typeof decoded === "object" && decoded !== null && "status" in decoded && decoded.status === "dispatched";
+				} catch {
+					return false;
+				}
+			});
+			// Make the next write of this record fail, then acknowledge as the genuine target.
+			await fs.rm(eventsDir, { recursive: true, force: true });
+			await fs.writeFile(eventsDir, "not a directory");
+			let rejected: unknown;
+			try {
+				await target.request({ op: "wake-ack", eventId: "evt-ack-persist-1", target: wakeTarget });
+			} catch (error) {
+				rejected = error;
+			}
+			expect(rejected).toBeInstanceOf(Error);
+			expect((rejected as Error).message).toContain("durably recorded");
+
+			const submitted = await submitPromise;
+			if (submitted.op !== "wake-submit") throw new Error("unexpected op");
+			expect(submitted.result.status).not.toBe("acked");
+			expect(submitted.result.ackedAt).toBeUndefined();
+		} finally {
+			await stopBroker([caller, target], caller, broker);
+		}
+	}, 20_000);
+
+	async function seedRecoveredEvent(
+		runtimeDir: string,
+		wakeEvent: ParentWakeEvent,
+		status: "pending" | "dispatched",
+	): Promise<void> {
+		const dir = path.join(runtimeDir, "parent-wake", "events");
+		await fs.mkdir(dir, { recursive: true });
+		await fs.writeFile(
+			path.join(dir, `${wakeEvent.eventId}.json`),
+			JSON.stringify({ event: wakeEvent, status, dispatchedAt: status === "dispatched" ? 1 : undefined }),
+		);
+	}
+
+	it("dispatches an event a restarted broker recovered as pending once its target registers, exactly once", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-recovered-pending-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const wakeTarget: ParentWakeTarget = { projectDir, sessionId: "parent-recovered", runtimeScope: "candidate-a" };
+		const caller = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const target = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		await seedRecoveredEvent(runtimeDir, event(wakeTarget, "evt-recovered-1"), "pending");
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			let deliveries = 0;
+			target.onParentWake(wakeTarget, () => {
+				deliveries++;
+			});
+			await waitFor(() => deliveries === 1);
+			const replay = await caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-recovered-1"),
+				timeoutMs: 5_000,
+			});
+			if (replay.op !== "wake-submit") throw new Error("unexpected op");
+			expect(replay.result.status).toBe("acked");
+			expect(deliveries).toBe(1);
+		} finally {
+			await stopBroker([caller, target], caller, broker);
+		}
+	}, 20_000);
+
+	it("settles recovered pending and dispatched events to a terminal result instead of hanging when no target returns", async () => {
+		using tempDir = TempDir.createSync("@omp-parent-wake-recovered-terminal-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const wakeTarget: ParentWakeTarget = { projectDir, sessionId: "parent-gone", runtimeScope: "candidate-a" };
+		const caller = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		await seedRecoveredEvent(runtimeDir, event(wakeTarget, "evt-recovered-pending"), "pending");
+		await seedRecoveredEvent(runtimeDir, event(wakeTarget, "evt-recovered-dispatched"), "dispatched");
+		const broker = startBroker(projectDir, runtimeDir);
+		try {
+			const pending = await caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-recovered-pending"),
+				timeoutMs: 300,
+			});
+			const dispatched = await caller.request({
+				op: "wake-submit",
+				event: event(wakeTarget, "evt-recovered-dispatched"),
+				timeoutMs: 300,
+			});
+			if (pending.op !== "wake-submit" || dispatched.op !== "wake-submit") throw new Error("unexpected op");
+			expect(pending.result.status).toBe("failed");
+			expect(pending.result.failureCode).toBe("target-missing");
+			expect(dispatched.result.status).toBe("failed");
+			expect(dispatched.result.failureCode).toBe("timeout");
+		} finally {
+			await stopBroker([caller], caller, broker);
 		}
 	}, 20_000);
 });

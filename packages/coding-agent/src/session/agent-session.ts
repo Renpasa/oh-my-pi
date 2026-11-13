@@ -444,6 +444,7 @@ import {
 } from "./prewalk";
 import {
 	buildParentWakeBatchMessage,
+	entryCarriesParentWake,
 	isParentWakeTargetSession,
 	PARENT_WAKE_MESSAGE_TYPE,
 	type ParentWakeEntry,
@@ -1125,6 +1126,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
+	/** Parent wake receipts by event id: in-flight or accepted this process; failures are dropped so a redelivery can retry. */
+	readonly #parentWakeReceipts = new Map<string, Promise<void>>();
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -10639,7 +10642,25 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (validated.target.sessionId !== this.sessionManager.getSessionId()) {
 			return Promise.reject(new Error("Parent wake event target does not match this session"));
 		}
+		// A wake already accepted by this session — in flight or committed to the session history, which
+		// survives restarts — is acknowledged again without being injected a second time. This is what makes
+		// a lost ACK followed by a broker redelivery harmless.
+		const known = this.#parentWakeReceipts.get(validated.eventId);
+		if (known) return known;
+		if (this.sessionManager.getEntries().some(entry => entryCarriesParentWake(entry, validated.eventId))) {
+			return Promise.resolve();
+		}
 		const delivered = this.yieldQueue.enqueueWithReceipt<ParentWakeEntry>(PARENT_WAKE_MESSAGE_TYPE, validated);
+		this.#parentWakeReceipts.set(validated.eventId, delivered);
+		if (this.#parentWakeReceipts.size > 512) {
+			const oldest = this.#parentWakeReceipts.keys().next().value;
+			if (oldest !== undefined) this.#parentWakeReceipts.delete(oldest);
+		}
+		delivered.catch(() => {
+			if (this.#parentWakeReceipts.get(validated.eventId) === delivered) {
+				this.#parentWakeReceipts.delete(validated.eventId);
+			}
+		});
 		this.yieldQueue.requestIdleFlush();
 		return delivered;
 	}

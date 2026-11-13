@@ -24,6 +24,8 @@ import {
 const CONNECT_TIMEOUT_MS = 10_000;
 const CONNECT_RETRY_MS = 50;
 const TOKEN_FILE = "broker.token";
+const WAKE_REREGISTER_ATTEMPTS = 10;
+const WAKE_REREGISTER_RETRY_MS = 100;
 /**
  * The broker must outlive whichever omp process happened to spawn it: other
  * clients (and persistent daemons) still hold its lease. Bun on Windows puts
@@ -278,16 +280,28 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		};
 	}
 
-	/** Reassert every held Parent Wake registration after a (re)connect — registration itself does not piggyback on every request like completion owners do. */
+	/**
+	 * Reassert every held Parent Wake registration after a (re)connect — registration itself does not piggyback on every request like completion owners do.
+	 * The broker refuses a registration while a previous connection of the same target still looks live, which can briefly
+	 * be the case right after a reconnect, so a refused registration is retried a few times while the target is still held.
+	 */
 	async #republishWakeTargets(): Promise<void> {
-		for (const target of this.#wakeTargets.values()) {
-			try {
-				await this.request({ op: "wake-register", target });
-			} catch (error) {
-				logger.warn("Parent wake re-registration failed", {
-					sessionId: target.sessionId,
-					error: error instanceof Error ? error.message : String(error),
-				});
+		for (const target of [...this.#wakeTargets.values()]) {
+			for (let attempt = 1; ; attempt++) {
+				if (this.#closed || this.#wakeTargets.get(target.sessionId) !== target) break;
+				try {
+					await this.request({ op: "wake-register", target });
+					break;
+				} catch (error) {
+					if (attempt >= WAKE_REREGISTER_ATTEMPTS) {
+						logger.warn("Parent wake re-registration failed", {
+							sessionId: target.sessionId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						break;
+					}
+					await Bun.sleep(WAKE_REREGISTER_RETRY_MS);
+				}
 			}
 		}
 	}

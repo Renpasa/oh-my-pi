@@ -71,3 +71,24 @@ test("buildSessionOptions rejects trusted extension directories", async () => {
 		/module file, not a directory/,
 	);
 });
+
+test("--strict-tools discovers and loads no extension: ambient, explicit, or trusted", async () => {
+	const extensionPath = tempDir.join("strict-extension.ts");
+	const trustedPath = tempDir.join("strict-trusted.ts");
+	await Bun.write(extensionPath, "export default function () { throw new Error('loaded under --strict-tools'); }");
+	await Bun.write(trustedPath, "export default function () { throw new Error('loaded under --strict-tools'); }");
+	const settings = Settings.isolated();
+	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+
+	for (const extra of [["--extension", extensionPath], ["--trusted-extension", trustedPath], []]) {
+		const parsed = parseArgs(["--tools", "read", "--strict-tools", ...extra]);
+		const options = await buildSessionOptions(parsed, [], SessionManager.inMemory(), modelRegistry, settings);
+
+		expect(options.restrictToolNames).toBe(true);
+		expect(options.disableExtensionDiscovery).toBe(true);
+		expect(options.additionalExtensionPaths).toEqual([]);
+		const result = await loadSessionExtensions(options, tempDir.path(), settings, new EventBus());
+		expect(result.errors).toEqual([]);
+		expect(result.extensions).toEqual([]);
+	}
+});
